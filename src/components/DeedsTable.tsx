@@ -58,6 +58,7 @@ const DeedsTable = ({ sectionTitle = "Description of Documents Scrutinized", tab
   const [loading, setLoading] = useState(true);
   const updateTimeouts = useRef<{ [key: string]: NodeJS.Timeout }>({});
   const deedsRef = useRef<Deed[]>([]);
+  const activelyEditingRef = useRef<Set<string>>(new Set()); // Track actively editing deed IDs
   const [customColumns, setCustomColumns] = useState<Array<{name: string, position: string}>>([]);
   const [showColumnDialog, setShowColumnDialog] = useState(false);
   const [newColumnName, setNewColumnName] = useState("");
@@ -232,10 +233,11 @@ const DeedsTable = ({ sectionTitle = "Description of Documents Scrutinized", tab
               setDeeds((prev) => [...prev, deed]);
             }
           } else if (payload.eventType === "UPDATE") {
-            // Skip update if user is actively editing this deed (has pending timeouts)
+            // Skip update if user is actively editing this deed
+            const isActivelyEditing = activelyEditingRef.current.has(deed.id);
             const hasPendingUpdate = Object.keys(updateTimeouts.current).some(key => key.startsWith(deed.id));
-            if (hasPendingUpdate) {
-              console.log("Skipping realtime update for deed with pending edits:", deed.id);
+            if (isActivelyEditing || hasPendingUpdate) {
+              console.log("Skipping realtime update for deed with active edits:", deed.id);
               return;
             }
             
@@ -418,6 +420,9 @@ const DeedsTable = ({ sectionTitle = "Description of Documents Scrutinized", tab
         }
       }, 500);
     } else {
+      // Mark this deed as actively being edited
+      activelyEditingRef.current.add(id);
+      
       // Normal field update for other fields
       setDeeds((prev) =>
         prev.map((deed) =>
@@ -445,11 +450,19 @@ const DeedsTable = ({ sectionTitle = "Description of Documents Scrutinized", tab
           console.error("Error updating deed:", error);
           toast.error("Failed to update deed");
         }
+        
+        // Remove from actively editing after a short delay to prevent race conditions
+        setTimeout(() => {
+          activelyEditingRef.current.delete(id);
+        }, 300);
       }, 500);
     }
   }, [deedTemplates]);
 
   const handleCustomFieldChange = useCallback((deedId: string, fieldKey: string, value: string) => {
+    // Mark this deed as actively being edited
+    activelyEditingRef.current.add(deedId);
+    
     // Update local state immediately
     setDeeds((prev) =>
       prev.map((deed) =>
@@ -481,6 +494,11 @@ const DeedsTable = ({ sectionTitle = "Description of Documents Scrutinized", tab
         console.error("Error updating custom field:", error);
         toast.error("Failed to update custom field");
       }
+      
+      // Remove from actively editing after a short delay
+      setTimeout(() => {
+        activelyEditingRef.current.delete(deedId);
+      }, 300);
     }, 500);
   }, []);
 
