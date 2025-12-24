@@ -51,7 +51,7 @@ const DocumentDetailsTable = ({ documents, onDocumentsChange }: DocumentDetailsT
     totalExtentSqFt: "",
     customMeasurements: {},
   });
-  
+
   const [customFields, setCustomFields] = useState<Array<{ id: string; label: string; value: string }>>([]);
 
   const handleInputChange = (field: keyof DocumentDetail, value: string) => {
@@ -67,16 +67,22 @@ const DocumentDetailsTable = ({ documents, onDocumentsChange }: DocumentDetailsT
   };
 
   const handleCustomFieldChange = (id: string, type: 'label' | 'value', value: string) => {
-    setCustomFields(prev => prev.map(field => 
+    setCustomFields(prev => prev.map(field =>
       field.id === id ? { ...field, [type]: value } : field
     ));
   };
 
   const handleAddDocument = () => {
+    console.log("Add Document button clicked!");
+    console.log("currentDoc:", currentDoc);
+    console.log("surveyNo:", currentDoc.surveyNo);
+
     if (!currentDoc.surveyNo) {
+      console.log("Survey No is empty - showing error");
       toast.error("Survey No is required");
       return;
     }
+    console.log("Survey No is valid, proceeding to add document...");
 
     // Build custom measurements from customFields
     const customMeasurements: Record<string, string> = {};
@@ -156,7 +162,7 @@ const DocumentDetailsTable = ({ documents, onDocumentsChange }: DocumentDetailsT
         totalExtentSqFt: docToEdit.totalExtentSqFt,
         customMeasurements: docToEdit.customMeasurements,
       });
-      
+
       // Populate custom fields
       if (docToEdit.customMeasurements) {
         const customFieldsArray = Object.entries(docToEdit.customMeasurements).map(([label, value]) => ({
@@ -166,7 +172,7 @@ const DocumentDetailsTable = ({ documents, onDocumentsChange }: DocumentDetailsT
         }));
         setCustomFields(customFieldsArray);
       }
-      
+
       // Remove the document from the list so it can be edited
       onDocumentsChange(documents.filter(doc => doc.id !== id));
       toast.info("Document loaded for editing");
@@ -196,7 +202,7 @@ const DocumentDetailsTable = ({ documents, onDocumentsChange }: DocumentDetailsT
               onChange={(e) => handleInputChange("docNo", e.target.value)}
             />
           </div>
-          
+
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div className="space-y-2">
               <Label htmlFor="surveyNo">Survey No *</Label>
@@ -207,7 +213,7 @@ const DocumentDetailsTable = ({ documents, onDocumentsChange }: DocumentDetailsT
                 onChange={(e) => handleInputChange("surveyNo", e.target.value)}
               />
             </div>
-            
+
             <div className="space-y-2">
               <Label htmlFor="asPerRevenueRecord">As per Revenue Record</Label>
               <Input
@@ -263,7 +269,7 @@ const DocumentDetailsTable = ({ documents, onDocumentsChange }: DocumentDetailsT
                     onChange={(e) => handleInputChange("northBy", e.target.value)}
                   />
                 </div>
-                
+
                 <div className="space-y-2">
                   <Label htmlFor="southBy">South By - ({currentDoc.southBy || "South By"})</Label>
                   <Input
@@ -393,7 +399,7 @@ const DocumentDetailsTable = ({ documents, onDocumentsChange }: DocumentDetailsT
             </div>
           </div>
 
-          <Button onClick={handleAddDocument} className="w-full md:w-auto">
+          <Button type="button" onClick={handleAddDocument} className="w-full md:w-auto">
             <Plus className="mr-2 h-4 w-4" />
             Add Document
           </Button>

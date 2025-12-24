@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef } from "react";
+import React, { useEffect, useState, useCallback, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -32,6 +32,7 @@ export interface Deed {
   nature_of_doc: string;
   custom_fields?: Record<string, string> | any;
   table_type?: string;
+  created_at?: string;
 }
 
 interface DeedTemplate {
@@ -59,7 +60,9 @@ const DeedsTable = ({ sectionTitle = "Description of Documents Scrutinized", tab
   const updateTimeouts = useRef<{ [key: string]: NodeJS.Timeout }>({});
   const deedsRef = useRef<Deed[]>([]);
   const activelyEditingRef = useRef<Set<string>>(new Set()); // Track actively editing deed IDs
-  const [customColumns, setCustomColumns] = useState<Array<{name: string, position: string}>>([]);
+  const recentlyInsertedIds = useRef<Set<string>>(new Set()); // Track recently inserted deed IDs to prevent realtime duplicates
+  const isCopyingRef = useRef<boolean>(false); // Flag to skip realtime inserts during copy operation
+  const [customColumns, setCustomColumns] = useState<Array<{ name: string, position: string }>>([]);
   const [showColumnDialog, setShowColumnDialog] = useState(false);
   const [newColumnName, setNewColumnName] = useState("");
   const [insertAfterColumn, setInsertAfterColumn] = useState<string>("");
@@ -112,7 +115,7 @@ const DeedsTable = ({ sectionTitle = "Description of Documents Scrutinized", tab
       .from("deeds")
       .select("*")
       .order("created_at", { ascending: true });
-    
+
     // Only the first table (tableType="table") should include null values for backward compatibility
     // All other tables should only show their specific table_type
     let data, error;
@@ -127,7 +130,7 @@ const DeedsTable = ({ sectionTitle = "Description of Documents Scrutinized", tab
       toast.error("Failed to load deeds");
       return;
     }
-    
+
     console.log("Raw deeds data from database:", data);
 
     // For the first table, filter to include both 'table' and null values
@@ -138,7 +141,7 @@ const DeedsTable = ({ sectionTitle = "Description of Documents Scrutinized", tab
       }
       return (deed as any).table_type === tableType;
     });
-    
+
     console.log("Filtered deeds for table type:", tableType, "count:", filteredData.length);
 
     setDeeds(filteredData);
@@ -178,11 +181,11 @@ const DeedsTable = ({ sectionTitle = "Description of Documents Scrutinized", tab
     const regex = /\{([a-zA-Z0-9_]+)\}/g;
     const matches = template.matchAll(regex);
     const placeholders = new Set<string>();
-    
+
     for (const match of matches) {
       placeholders.add(match[1]);
     }
-    
+
     return Array.from(placeholders);
   };
 
@@ -190,16 +193,16 @@ const DeedsTable = ({ sectionTitle = "Description of Documents Scrutinized", tab
   const getDynamicPlaceholders = (deedType: string): string[] => {
     const previewTemplate = deedTemplates.find(t => t.deed_type === deedType)?.preview_template || "";
     const historyTemplate = historyTemplates.find(t => t.deed_type === deedType)?.template_content || "";
-    
+
     // Combine placeholders from both templates
     const allPlaceholders = new Set<string>();
-    
+
     extractPlaceholders(previewTemplate).forEach(p => allPlaceholders.add(p));
     extractPlaceholders(historyTemplate).forEach(p => allPlaceholders.add(p));
-    
+
     // Exclude standard fields that are already handled separately
     const excludedFields = ['deedType', 'date', 'documentNumber', 'natureOfDoc'];
-    
+
     return Array.from(allPlaceholders).filter(p => !excludedFields.includes(p));
   };
 
@@ -216,11 +219,11 @@ const DeedsTable = ({ sectionTitle = "Description of Documents Scrutinized", tab
         (payload) => {
           const deed = payload.new as Deed;
           const deedTableType = (deed as any).table_type;
-          
+
           // Only process events for deeds that belong to this table
           // For the main table, accept both 'table' and null values
           // For other tables, only accept exact matches
-          const shouldInclude = tableType === "table" 
+          const shouldInclude = tableType === "table"
             ? (deedTableType === tableType || !deedTableType)
             : deedTableType === tableType;
 
@@ -229,6 +232,16 @@ const DeedsTable = ({ sectionTitle = "Description of Documents Scrutinized", tab
           }
 
           if (payload.eventType === "INSERT") {
+            // Skip all inserts during copy operation to preserve order
+            if (isCopyingRef.current) {
+              console.log("Skipping realtime insert during copy operation:", deed.id);
+              return;
+            }
+            // Skip if this deed was recently inserted manually (to avoid duplicates)
+            if (recentlyInsertedIds.current.has(deed.id)) {
+              console.log("Skipping realtime insert for manually inserted deed:", deed.id);
+              return;
+            }
             if (shouldInclude) {
               setDeeds((prev) => [...prev, deed]);
             }
@@ -240,13 +253,13 @@ const DeedsTable = ({ sectionTitle = "Description of Documents Scrutinized", tab
               console.log("Skipping realtime update for deed with active edits:", deed.id);
               return;
             }
-            
+
             setDeeds((prev) =>
               prev.map((d) =>
                 d.id === deed.id ? deed : d
               ).filter(d => {
                 const tableTypeCheck = (d as any).table_type;
-                return tableType === "table" 
+                return tableType === "table"
                   ? (tableTypeCheck === tableType || !tableTypeCheck)
                   : tableTypeCheck === tableType;
               })
@@ -285,6 +298,97 @@ const DeedsTable = ({ sectionTitle = "Description of Documents Scrutinized", tab
       toast.success("Deed added");
     }
   };
+
+  // Insert a new deed at a specific position (after the given index)
+  const handleInsertDeed = async (afterIndex: number) => {
+    // Get the current deeds to find the created_at timestamps
+    const currentDeeds = deedsRef.current;
+
+    if (afterIndex < 0 || afterIndex >= currentDeeds.length) {
+      // If inserting at end, just add a new deed
+      handleAddDeed();
+      return;
+    }
+
+    // Calculate the created_at timestamp to be between the adjacent rows
+    // This ensures proper ordering when sorted by created_at
+    let insertCreatedAt: string;
+
+    const currentDeed = currentDeeds[afterIndex];
+    const nextDeed = currentDeeds[afterIndex + 1];
+
+    if (nextDeed && currentDeed.created_at && nextDeed.created_at) {
+      // Calculate midpoint between current and next deed's timestamps
+      const currentTime = new Date(currentDeed.created_at).getTime();
+      const nextTime = new Date(nextDeed.created_at).getTime();
+      const midTime = Math.floor((currentTime + nextTime) / 2);
+      insertCreatedAt = new Date(midTime).toISOString();
+    } else if (currentDeed.created_at) {
+      // Insert after current deed, 1 second later
+      const currentTime = new Date(currentDeed.created_at).getTime();
+      insertCreatedAt = new Date(currentTime + 1000).toISOString();
+    } else {
+      // Fallback to current time
+      insertCreatedAt = new Date().toISOString();
+    }
+
+    const newDeed = {
+      deed_type: "",
+      executed_by: "",
+      in_favour_of: "",
+      date: null,
+      document_number: "",
+      nature_of_doc: "",
+      table_type: tableType,
+      user_id: null,
+      custom_fields: {}
+    };
+
+    // Insert the new deed and get it back
+    const { data: insertedDeed, error: insertError } = await supabase
+      .from("deeds")
+      .insert(newDeed)
+      .select()
+      .single();
+
+    if (insertError) {
+      console.error("Error inserting deed:", insertError);
+      toast.error(`Failed to insert deed: ${insertError.message}`);
+      return;
+    }
+
+    // Update the created_at timestamp to ensure correct ordering
+    // This is needed because Supabase might ignore created_at during insert
+    const { error: updateError } = await supabase
+      .from("deeds")
+      .update({ created_at: insertCreatedAt })
+      .eq("id", insertedDeed.id);
+
+    if (updateError) {
+      console.error("Error updating deed timestamp:", updateError);
+      // Continue anyway - local state will still show correct order
+    }
+
+    // Update the insertedDeed with the correct timestamp for local state
+    insertedDeed.created_at = insertCreatedAt;
+
+    // Track this ID so realtime subscription doesn't duplicate it
+    recentlyInsertedIds.current.add(insertedDeed.id);
+
+    // Clear from tracking after 2 seconds
+    setTimeout(() => {
+      recentlyInsertedIds.current.delete(insertedDeed.id);
+    }, 2000);
+
+    // Manually insert at the correct position in local state
+    setDeeds(prev => {
+      const newDeeds = [...prev];
+      newDeeds.splice(afterIndex + 1, 0, insertedDeed);
+      return newDeeds;
+    });
+
+    toast.success("Deed inserted");
+  };
   const handleRemoveDeed = async (id: string) => {
     const { error } = await supabase.from("deeds").delete().eq("id", id);
 
@@ -296,45 +400,49 @@ const DeedsTable = ({ sectionTitle = "Description of Documents Scrutinized", tab
 
   const handleCopyFromPreviousTable = async () => {
     if (!copyFromTableType) return;
-    
+
+    // Set flag to prevent realtime inserts during copy
+    isCopyingRef.current = true;
+
     try {
       // Fetch deeds from the source table
       // Handle the main table which can have null or 'table' as table_type
       let query = supabase
         .from("deeds")
         .select("*");
-      
+
       if (copyFromTableType === 'table') {
         query = query.or(`table_type.eq.${copyFromTableType},table_type.is.null`);
       } else {
         query = query.eq("table_type", copyFromTableType);
       }
-      
+
       // Order by created_at to preserve the original order
       query = query.order("created_at", { ascending: true });
-      
+
       const { data: sourceDeedsData, error: fetchError } = await query;
-      
+
       if (fetchError) throw fetchError;
-      
+
       if (!sourceDeedsData || sourceDeedsData.length === 0) {
         toast.info("No deeds found in the source table to copy");
         return;
       }
-      
+
       // Fetch existing deeds in current table to check what's already been copied
       const { data: existingDeeds, error: existingError } = await supabase
         .from("deeds")
         .select("*")
-        .eq("table_type", tableType);
-      
+        .eq("table_type", tableType)
+        .order("created_at", { ascending: true });
+
       if (existingError) throw existingError;
-      
+
       // Filter out deeds that have already been copied
       // A deed is considered "already copied" if it has the same deed_type, executed_by, 
       // in_favour_of, date, and document_number
       const deedsToInsert = sourceDeedsData.filter(sourceDeed => {
-        return !existingDeeds?.some(existingDeed => 
+        return !existingDeeds?.some(existingDeed =>
           existingDeed.deed_type === sourceDeed.deed_type &&
           existingDeed.executed_by === sourceDeed.executed_by &&
           existingDeed.in_favour_of === sourceDeed.in_favour_of &&
@@ -342,12 +450,15 @@ const DeedsTable = ({ sectionTitle = "Description of Documents Scrutinized", tab
           existingDeed.document_number === sourceDeed.document_number
         );
       });
-      
+
       if (deedsToInsert.length === 0) {
         toast.info("All deeds from source table have already been copied");
         return;
       }
-      
+
+      // Collect all inserted deeds to add to local state in correct order
+      const insertedDeeds: Deed[] = [];
+
       // Insert only new deeds sequentially to preserve order
       for (const sourceDeed of deedsToInsert) {
         const newDeed = {
@@ -361,19 +472,36 @@ const DeedsTable = ({ sectionTitle = "Description of Documents Scrutinized", tab
           table_type: tableType,
           user_id: null
         };
-        
-        const { error: insertError } = await supabase
+
+        const { data: insertedDeed, error: insertError } = await supabase
           .from("deeds")
-          .insert(newDeed);
-        
+          .insert(newDeed)
+          .select()
+          .single();
+
         if (insertError) throw insertError;
-        
-        // Small delay to ensure different timestamps for proper ordering
-        await new Promise(resolve => setTimeout(resolve, 50));
+
+        // Track this ID so realtime subscription doesn't duplicate it
+        recentlyInsertedIds.current.add(insertedDeed.id);
+        insertedDeeds.push(insertedDeed);
       }
-      
+
+      // Manually add all copied deeds to local state in the EXACT order they were in the source
+      // This preserves the order regardless of database timestamps
+      setDeeds(prev => [...prev, ...insertedDeeds]);
+
+      // Reset copying flag
+      isCopyingRef.current = false;
+
+      // Clear tracking after a delay
+      setTimeout(() => {
+        insertedDeeds.forEach(d => recentlyInsertedIds.current.delete(d.id));
+      }, 3000);
+
       toast.success(`Copied ${deedsToInsert.length} new deed(s) successfully`);
     } catch (error) {
+      // Reset copying flag on error too
+      isCopyingRef.current = false;
       console.error("Error copying deeds:", error);
       toast.error("Failed to copy deeds from previous table");
     }
@@ -386,7 +514,7 @@ const DeedsTable = ({ sectionTitle = "Description of Documents Scrutinized", tab
     if (field === "deed_type" && typeof value === "string") {
       const template = deedTemplates.find(t => t.deed_type === value);
       const customPlaceholders = template?.custom_placeholders || {};
-      
+
       // Initialize custom_fields with empty strings for all placeholder keys
       const initializedCustomFields: Record<string, string> = {};
       Object.keys(customPlaceholders).forEach(key => {
@@ -396,8 +524,8 @@ const DeedsTable = ({ sectionTitle = "Description of Documents Scrutinized", tab
       // Update local state with both deed_type and initialized custom_fields
       setDeeds((prev) =>
         prev.map((deed) =>
-          deed.id === id 
-            ? { ...deed, [field]: value, custom_fields: initializedCustomFields } 
+          deed.id === id
+            ? { ...deed, [field]: value, custom_fields: initializedCustomFields }
             : deed
         )
       );
@@ -422,7 +550,7 @@ const DeedsTable = ({ sectionTitle = "Description of Documents Scrutinized", tab
     } else {
       // Mark this deed as actively being edited
       activelyEditingRef.current.add(id);
-      
+
       // Normal field update for other fields
       setDeeds((prev) =>
         prev.map((deed) =>
@@ -440,7 +568,7 @@ const DeedsTable = ({ sectionTitle = "Description of Documents Scrutinized", tab
       updateTimeouts.current[timeoutKey] = setTimeout(async () => {
         // Handle null date properly
         const updateValue = field === "date" && value === "" ? null : value;
-        
+
         const { error } = await supabase
           .from("deeds")
           .update({ [field]: updateValue })
@@ -450,7 +578,7 @@ const DeedsTable = ({ sectionTitle = "Description of Documents Scrutinized", tab
           console.error("Error updating deed:", error);
           toast.error("Failed to update deed");
         }
-        
+
         // Remove from actively editing after a short delay to prevent race conditions
         setTimeout(() => {
           activelyEditingRef.current.delete(id);
@@ -462,7 +590,7 @@ const DeedsTable = ({ sectionTitle = "Description of Documents Scrutinized", tab
   const handleCustomFieldChange = useCallback((deedId: string, fieldKey: string, value: string) => {
     // Mark this deed as actively being edited
     activelyEditingRef.current.add(deedId);
-    
+
     // Update local state immediately
     setDeeds((prev) =>
       prev.map((deed) =>
@@ -494,7 +622,7 @@ const DeedsTable = ({ sectionTitle = "Description of Documents Scrutinized", tab
         console.error("Error updating custom field:", error);
         toast.error("Failed to update custom field");
       }
-      
+
       // Remove from actively editing after a short delay
       setTimeout(() => {
         activelyEditingRef.current.delete(deedId);
@@ -518,7 +646,7 @@ const DeedsTable = ({ sectionTitle = "Description of Documents Scrutinized", tab
       .replace(/{natureOfDoc}/g, deed.nature_of_doc)
       .replace(/{extent}/g, deed.custom_fields?.extent || "")
       .replace(/{surveyNo}/g, deed.custom_fields?.surveyNo || "");
-    
+
     // Replace any other custom fields
     if (deed.custom_fields && typeof deed.custom_fields === 'object') {
       Object.entries(deed.custom_fields).forEach(([key, value]) => {
@@ -526,7 +654,7 @@ const DeedsTable = ({ sectionTitle = "Description of Documents Scrutinized", tab
         preview = preview.replace(regex, String(value || ""));
       });
     }
-    
+
     return preview;
   };
 
@@ -554,7 +682,7 @@ const DeedsTable = ({ sectionTitle = "Description of Documents Scrutinized", tab
     const updatedColumns = customColumns.filter(col => col.name !== columnName);
     setCustomColumns(updatedColumns);
     localStorage.setItem(`customColumns_${tableType}`, JSON.stringify(updatedColumns));
-    
+
     // Remove data for this column
     const updatedData = { ...customColumnData };
     Object.keys(updatedData).forEach(deedId => {
@@ -773,207 +901,283 @@ const DeedsTable = ({ sectionTitle = "Description of Documents Scrutinized", tab
               </thead>
               <tbody>
                 {deeds.map((deed, index) => (
-                <tr key={deed.id} className="border-b border-border hover:bg-muted/50 transition-colors">
-                    <td className="p-3 text-sm font-medium">{index + 1}</td>
-                    {getColumnsAfter('sno').map((col) => (
-                      <td key={col.name} className="p-3">
-                        <Input
-                          value={customColumnData[deed.id]?.[col.name] || ''}
-                          onChange={(e) => handleCustomColumnChange(deed.id, col.name, e.target.value)}
-                          placeholder={col.name}
-                          className="transition-all duration-200"
-                        />
-                      </td>
-                    ))}
-                    <td className="p-3">
-                      <Popover>
-                        <PopoverTrigger asChild>
-                          <Button
-                            variant="outline"
-                            className={cn(
-                              "w-[150px] justify-start text-left font-normal",
-                              !deed.date && "text-muted-foreground"
-                            )}
-                          >
-                            <CalendarIcon className="mr-2 h-4 w-4" />
-                            {deed.date ? format(parse(deed.date, 'yyyy-MM-dd', new Date()), 'dd-MM-yyyy') : <span>Nil</span>}
-                          </Button>
-                        </PopoverTrigger>
-                        <PopoverContent className="w-auto p-0" align="start">
-                          <div className="p-2 border-b">
+                  <React.Fragment key={deed.id}>
+                    {/* Insert button row - shows between deeds */}
+                    {index === 0 && (
+                      <tr key={`insert-before-${deed.id}`}>
+                        <td colSpan={100} className="p-0">
+                          <div className="flex justify-center items-center py-1">
+                            <div className="flex-1 border-t border-dashed border-gray-300"></div>
                             <Button
-                              variant="ghost"
+                              variant="outline"
                               size="sm"
-                              className="w-full justify-start text-muted-foreground"
-                              onClick={() => handleUpdateDeed(deed.id, "date", "")}
+                              onClick={() => handleInsertDeed(-1)}
+                              className="h-6 px-3 mx-2 text-xs text-primary border-primary/30 hover:bg-primary/10 hover:border-primary"
                             >
-                              Set as Nil
+                              <Plus className="h-3 w-3 mr-1" />
+                              Insert Row
                             </Button>
+                            <div className="flex-1 border-t border-dashed border-gray-300"></div>
                           </div>
-                          <Calendar
-                            mode="single"
-                            selected={deed.date ? parse(deed.date, 'yyyy-MM-dd', new Date()) : undefined}
-                            onSelect={(date) => {
-                              if (date) {
-                                handleUpdateDeed(deed.id, "date", format(date, 'yyyy-MM-dd'));
-                              }
-                            }}
-                            initialFocus
+                        </td>
+                      </tr>
+                    )}
+                    <tr key={deed.id} className="border-b border-border hover:bg-muted/50 transition-colors">
+                      <td className="p-3 text-sm font-medium">{index + 1}</td>
+                      {getColumnsAfter('sno').map((col) => (
+                        <td key={col.name} className="p-3">
+                          <Input
+                            value={customColumnData[deed.id]?.[col.name] || ''}
+                            onChange={(e) => handleCustomColumnChange(deed.id, col.name, e.target.value)}
+                            placeholder={col.name}
+                            className="transition-all duration-200"
                           />
-                        </PopoverContent>
-                      </Popover>
-                    </td>
-                    {getColumnsAfter('date').map((col) => (
-                      <td key={col.name} className="p-3">
+                        </td>
+                      ))}
+                      <td className="p-3">
+                        <Popover>
+                          <PopoverTrigger asChild>
+                            <Button
+                              variant="outline"
+                              className={cn(
+                                "w-[150px] justify-start text-left font-normal",
+                                !deed.date && "text-muted-foreground"
+                              )}
+                            >
+                              <CalendarIcon className="mr-2 h-4 w-4" />
+                              {deed.date ? format(parse(deed.date, 'yyyy-MM-dd', new Date()), 'dd-MM-yyyy') : <span>Nil</span>}
+                            </Button>
+                          </PopoverTrigger>
+                          <PopoverContent className="w-auto p-0" align="start">
+                            <div className="p-2 border-b">
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="w-full justify-start text-muted-foreground"
+                                onClick={() => handleUpdateDeed(deed.id, "date", "")}
+                              >
+                                Set as Nil
+                              </Button>
+                            </div>
+                            <div className="p-3 border-b">
+                              <Input
+                                type="text"
+                                placeholder="dd-mm-yyyy"
+                                defaultValue={deed.date ? format(parse(deed.date, 'yyyy-MM-dd', new Date()), 'dd-MM-yyyy') : ''}
+                                onBlur={(e) => {
+                                  const value = e.target.value.trim();
+                                  if (value) {
+                                    try {
+                                      const parsedDate = parse(value, 'dd-MM-yyyy', new Date());
+                                      if (!isNaN(parsedDate.getTime())) {
+                                        handleUpdateDeed(deed.id, "date", format(parsedDate, 'yyyy-MM-dd'));
+                                      }
+                                    } catch (error) {
+                                      // Invalid date format, ignore
+                                    }
+                                  }
+                                }}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter') {
+                                    const value = (e.target as HTMLInputElement).value.trim();
+                                    if (value) {
+                                      try {
+                                        const parsedDate = parse(value, 'dd-MM-yyyy', new Date());
+                                        if (!isNaN(parsedDate.getTime())) {
+                                          handleUpdateDeed(deed.id, "date", format(parsedDate, 'yyyy-MM-dd'));
+                                        }
+                                      } catch (error) {
+                                        // Invalid date format, ignore
+                                      }
+                                    }
+                                  }
+                                }}
+                                className="w-full"
+                              />
+                            </div>
+                            <Calendar
+                              mode="single"
+                              selected={deed.date ? parse(deed.date, 'yyyy-MM-dd', new Date()) : undefined}
+                              onSelect={(date) => {
+                                if (date) {
+                                  handleUpdateDeed(deed.id, "date", format(date, 'yyyy-MM-dd'));
+                                }
+                              }}
+                              initialFocus
+                            />
+                          </PopoverContent>
+                        </Popover>
+                      </td>
+                      {getColumnsAfter('date').map((col) => (
+                        <td key={col.name} className="p-3">
+                          <Input
+                            value={customColumnData[deed.id]?.[col.name] || ''}
+                            onChange={(e) => handleCustomColumnChange(deed.id, col.name, e.target.value)}
+                            placeholder={col.name}
+                            className="transition-all duration-200"
+                          />
+                        </td>
+                      ))}
+                      <td className="p-3">
                         <Input
-                          value={customColumnData[deed.id]?.[col.name] || ''}
-                          onChange={(e) => handleCustomColumnChange(deed.id, col.name, e.target.value)}
-                          placeholder={col.name}
+                          value={deed.document_number}
+                          onChange={(e) => handleUpdateDeed(deed.id, "document_number", e.target.value)}
+                          placeholder="Document Number"
                           className="transition-all duration-200"
                         />
                       </td>
-                    ))}
-                    <td className="p-3">
-                      <Input
-                        value={deed.document_number}
-                        onChange={(e) => handleUpdateDeed(deed.id, "document_number", e.target.value)}
-                        placeholder="Document Number"
-                        className="transition-all duration-200"
-                      />
-                    </td>
-                    {getColumnsAfter('dno').map((col) => (
-                      <td key={col.name} className="p-3">
-                        <Input
-                          value={customColumnData[deed.id]?.[col.name] || ''}
-                          onChange={(e) => handleCustomColumnChange(deed.id, col.name, e.target.value)}
-                          placeholder={col.name}
-                          className="transition-all duration-200"
-                        />
+                      {getColumnsAfter('dno').map((col) => (
+                        <td key={col.name} className="p-3">
+                          <Input
+                            value={customColumnData[deed.id]?.[col.name] || ''}
+                            onChange={(e) => handleCustomColumnChange(deed.id, col.name, e.target.value)}
+                            placeholder={col.name}
+                            className="transition-all duration-200"
+                          />
+                        </td>
+                      ))}
+                      <td className="p-3">
+                        <div className="space-y-3">
+                          <Select value={deed.deed_type} onValueChange={(value) => handleUpdateDeed(deed.id, "deed_type", value)}>
+                            <SelectTrigger className="transition-all duration-200">
+                              <SelectValue placeholder="Select deed type" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {deedTypes.map((type) => (
+                                <SelectItem key={type} value={type}>
+                                  {type}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+
+                          {/* Dynamic fields based on template placeholders */}
+                          {deed.deed_type && getDynamicPlaceholders(deed.deed_type).length > 0 && (
+                            <div className="grid grid-cols-2 gap-2">
+                              {getDynamicPlaceholders(deed.deed_type).map((placeholder) => {
+                                const formatLabel = (key: string) => {
+                                  return key
+                                    .replace(/([A-Z])/g, ' $1')
+                                    .replace(/^./, (str) => str.toUpperCase())
+                                    .trim();
+                                };
+
+                                // Get value from legacy fields or custom_fields
+                                let value = '';
+                                if (placeholder === 'executedBy') {
+                                  value = deed.executed_by || (deed.custom_fields?.executedBy || '');
+                                } else if (placeholder === 'inFavourOf') {
+                                  value = deed.in_favour_of || (deed.custom_fields?.inFavourOf || '');
+                                } else {
+                                  value = deed.custom_fields?.[placeholder] || '';
+                                }
+
+                                return (
+                                  <Input
+                                    key={placeholder}
+                                    value={value}
+                                    onChange={(e) => {
+                                      // Update legacy fields for backward compatibility
+                                      if (placeholder === 'executedBy') {
+                                        handleUpdateDeed(deed.id, "executed_by", e.target.value);
+                                      } else if (placeholder === 'inFavourOf') {
+                                        handleUpdateDeed(deed.id, "in_favour_of", e.target.value);
+                                      }
+                                      // Also update in custom_fields
+                                      handleCustomFieldChange(deed.id, placeholder, e.target.value);
+                                    }}
+                                    placeholder={formatLabel(placeholder)}
+                                    className="transition-all duration-200"
+                                  />
+                                );
+                              })}
+                            </div>
+                          )}
+
+                          {deed.deed_type && getPreviewTemplate(deed.deed_type).trim() !== "" && (
+                            <div className="p-2 bg-muted rounded text-sm">
+                              <strong>Preview:</strong> {generatePreview(deed)}
+                            </div>
+                          )}
+
+                          <DeedCustomFields
+                            customPlaceholders={deed.deed_type ? (deedTemplates.find(t => t.deed_type === deed.deed_type)?.custom_placeholders || {}) : {}}
+                            customValues={deed.custom_fields || {}}
+                            onCustomValueChange={(key, value) => handleCustomFieldChange(deed.id, key, value)}
+                          />
+                        </div>
                       </td>
-                    ))}
-                    <td className="p-3">
-                      <div className="space-y-3">
-                        <Select value={deed.deed_type} onValueChange={(value) => handleUpdateDeed(deed.id, "deed_type", value)}>
+                      {getColumnsAfter('particulars').map((col) => (
+                        <td key={col.name} className="p-3">
+                          <Input
+                            value={customColumnData[deed.id]?.[col.name] || ''}
+                            onChange={(e) => handleCustomColumnChange(deed.id, col.name, e.target.value)}
+                            placeholder={col.name}
+                            className="transition-all duration-200"
+                          />
+                        </td>
+                      ))}
+                      <td className="p-3">
+                        <Select
+                          value={deed.nature_of_doc}
+                          onValueChange={(value) => handleUpdateDeed(deed.id, "nature_of_doc", value)}
+                        >
                           <SelectTrigger className="transition-all duration-200">
-                            <SelectValue placeholder="Select deed type" />
+                            <SelectValue placeholder="Select type" />
                           </SelectTrigger>
                           <SelectContent>
-                            {deedTypes.map((type) => (
-                              <SelectItem key={type} value={type}>
-                                {type}
-                              </SelectItem>
-                            ))}
+                            <SelectItem value="Original">Original</SelectItem>
+                            <SelectItem value="Xerox">Xerox</SelectItem>
+                            <SelectItem value="Online Copy">Online Copy</SelectItem>
+                            <SelectItem value="Online E-Copy">Online E-Copy</SelectItem>
+                            <SelectItem value="SRO Copy">SRO Copy</SelectItem>
+                            <SelectItem value="True copy">True copy</SelectItem>
+                            <SelectItem value="Photocopy">Photocopy</SelectItem>
+                            <SelectItem value="Duplicate of Original">Duplicate of Original</SelectItem>
+                            <SelectItem value="Screenshot copy">Screenshot copy</SelectItem>
                           </SelectContent>
                         </Select>
-                        
-                        {/* Dynamic fields based on template placeholders */}
-                        {deed.deed_type && getDynamicPlaceholders(deed.deed_type).length > 0 && (
-                          <div className="grid grid-cols-2 gap-2">
-                            {getDynamicPlaceholders(deed.deed_type).map((placeholder) => {
-                              const formatLabel = (key: string) => {
-                                return key
-                                  .replace(/([A-Z])/g, ' $1')
-                                  .replace(/^./, (str) => str.toUpperCase())
-                                  .trim();
-                              };
-                              
-                              // Get value from legacy fields or custom_fields
-                              let value = '';
-                              if (placeholder === 'executedBy') {
-                                value = deed.executed_by || (deed.custom_fields?.executedBy || '');
-                              } else if (placeholder === 'inFavourOf') {
-                                value = deed.in_favour_of || (deed.custom_fields?.inFavourOf || '');
-                              } else {
-                                value = deed.custom_fields?.[placeholder] || '';
-                              }
-                              
-                              return (
-                                <Input
-                                  key={placeholder}
-                                  value={value}
-                                  onChange={(e) => {
-                                    // Update legacy fields for backward compatibility
-                                    if (placeholder === 'executedBy') {
-                                      handleUpdateDeed(deed.id, "executed_by", e.target.value);
-                                    } else if (placeholder === 'inFavourOf') {
-                                      handleUpdateDeed(deed.id, "in_favour_of", e.target.value);
-                                    }
-                                    // Also update in custom_fields
-                                    handleCustomFieldChange(deed.id, placeholder, e.target.value);
-                                  }}
-                                  placeholder={formatLabel(placeholder)}
-                                  className="transition-all duration-200"
-                                />
-                              );
-                            })}
-                          </div>
-                        )}
-                        
-                        {deed.deed_type && getPreviewTemplate(deed.deed_type).trim() !== "" && (
-                          <div className="p-2 bg-muted rounded text-sm">
-                            <strong>Preview:</strong> {generatePreview(deed)}
-                          </div>
-                        )}
-                        
-                        <DeedCustomFields
-                          customPlaceholders={deed.deed_type ? (deedTemplates.find(t => t.deed_type === deed.deed_type)?.custom_placeholders || {}) : {}}
-                          customValues={deed.custom_fields || {}}
-                          onCustomValueChange={(key, value) => handleCustomFieldChange(deed.id, key, value)}
-                        />
-                      </div>
-                    </td>
-                    {getColumnsAfter('particulars').map((col) => (
-                      <td key={col.name} className="p-3">
-                        <Input
-                          value={customColumnData[deed.id]?.[col.name] || ''}
-                          onChange={(e) => handleCustomColumnChange(deed.id, col.name, e.target.value)}
-                          placeholder={col.name}
-                          className="transition-all duration-200"
-                        />
                       </td>
-                    ))}
-                    <td className="p-3">
-                      <Select 
-                        value={deed.nature_of_doc} 
-                        onValueChange={(value) => handleUpdateDeed(deed.id, "nature_of_doc", value)}
-                      >
-                        <SelectTrigger className="transition-all duration-200">
-                          <SelectValue placeholder="Select type" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="Original">Original</SelectItem>
-                          <SelectItem value="Xerox">Xerox</SelectItem>
-                          <SelectItem value="Online Copy">Online Copy</SelectItem>
-                          <SelectItem value="Online E-Copy">Online E-Copy</SelectItem>
-                          <SelectItem value="SRO Copy">SRO Copy</SelectItem>
-                          <SelectItem value="True copy">True copy</SelectItem>
-                          <SelectItem value="Photocopy">Photocopy</SelectItem>
-                          <SelectItem value="Duplicate of Original">Duplicate of Original</SelectItem>
-                          <SelectItem value="Screenshot copy">Screenshot copy</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </td>
-                    {getColumnsAfter('nature').map((col) => (
-                      <td key={col.name} className="p-3">
-                        <Input
-                          value={customColumnData[deed.id]?.[col.name] || ''}
-                          onChange={(e) => handleCustomColumnChange(deed.id, col.name, e.target.value)}
-                          placeholder={col.name}
-                          className="transition-all duration-200"
-                        />
+                      {getColumnsAfter('nature').map((col) => (
+                        <td key={col.name} className="p-3">
+                          <Input
+                            value={customColumnData[deed.id]?.[col.name] || ''}
+                            onChange={(e) => handleCustomColumnChange(deed.id, col.name, e.target.value)}
+                            placeholder={col.name}
+                            className="transition-all duration-200"
+                          />
+                        </td>
+                      ))}
+                      <td className="p-3 text-center">
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => handleRemoveDeed(deed.id)}
+                          className="text-destructive hover:text-destructive hover:bg-destructive/10"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </Button>
                       </td>
-                    ))}
-                    <td className="p-3 text-center">
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => handleRemoveDeed(deed.id)}
-                        className="text-destructive hover:text-destructive hover:bg-destructive/10"
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </Button>
-                    </td>
-                  </tr>
+                    </tr>
+                    {/* Insert button row - shows after each deed */}
+                    <tr key={`insert-after-${deed.id}`}>
+                      <td colSpan={100} className="p-0">
+                        <div className="flex justify-center items-center py-1">
+                          <div className="flex-1 border-t border-dashed border-gray-300"></div>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => handleInsertDeed(index)}
+                            className="h-6 px-3 mx-2 text-xs text-primary border-primary/30 hover:bg-primary/10 hover:border-primary"
+                          >
+                            <Plus className="h-3 w-3 mr-1" />
+                            Insert Row
+                          </Button>
+                          <div className="flex-1 border-t border-dashed border-gray-300"></div>
+                        </div>
+                      </td>
+                    </tr>
+                  </React.Fragment>
                 ))}
               </tbody>
             </table>
